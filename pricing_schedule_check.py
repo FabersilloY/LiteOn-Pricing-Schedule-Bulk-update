@@ -9,6 +9,7 @@ import threading
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
+from collections import Counter
 
 # ============================================================================
 # Cache configuration (shared with site_lookup.py)
@@ -22,6 +23,9 @@ PROGRESS_FILE = CACHE_DIR / "pricing_check_progress.json"
 
 # Odd ones out tracking file
 ODD_ONES_FILE = CACHE_DIR / "pricing_odd_ones_out.json"
+
+# Pricing values cache file (per ACC)
+PRICING_VALUES_FILE = CACHE_DIR / "pricing_values_cache.json"
 
 # JWT refresh interval (10 minutes)
 JWT_REFRESH_INTERVAL = 600  # seconds
@@ -191,6 +195,251 @@ def stop_jwt_refresh_timer():
     if _jwt_refresh_timer is not None:
         _jwt_refresh_timer.cancel()
         _jwt_refresh_timer = None
+
+
+# ============================================================================
+# Pricing Mode Management
+# ============================================================================
+def load_pricing_values_cache() -> Dict[str, Any]:
+    """Load cached pricing values per ACC."""
+    if not PRICING_VALUES_FILE.exists():
+        return {}
+    
+    try:
+        with open(PRICING_VALUES_FILE, 'r') as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError) as e:
+        print(f"[WARNING] Failed to load pricing values cache: {e}")
+        return {}
+
+
+def save_pricing_values_cache(data: Dict[str, Any]):
+    """Save pricing values cache."""
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(PRICING_VALUES_FILE, 'w') as f:
+            json.dump(data, f, indent=2)
+    except IOError as e:
+        print(f"[WARNING] Failed to save pricing values cache: {e}")
+
+
+def get_cached_pricing_value(acn_id: str, acc_id: str) -> Optional[float]:
+    """Get cached pricing value for an ACC."""
+    cache = load_pricing_values_cache()
+    key = f"{acn_id}-{acc_id}"
+    entry = cache.get(key)
+    if entry:
+        return entry.get("value")
+    return None
+
+
+def save_pricing_value(acn_id: str, acc_id: str, value: float, source: str = "auto"):
+    """Save pricing value for an ACC to cache."""
+    cache = load_pricing_values_cache()
+    key = f"{acn_id}-{acc_id}"
+    cache[key] = {
+        "acn_id": acn_id,
+        "acc_id": acc_id,
+        "value": value,
+        "source": source,
+        "updated_at": datetime.now().isoformat()
+    }
+    save_pricing_values_cache(cache)
+
+
+def calculate_majority_pricing(acn_id: str, acc_id: str) -> Optional[float]:
+    """
+    Calculate the majority pricing value from already-configured stations in an ACC.
+    Returns the most common f value, or None if no configured stations found.
+    """
+    print(f"  🔍 Calculating majority pricing for ACC {acn_id}-{acc_id}...")
+    
+    # Fetch station data
+    stations = fetch_station_data(acn_id, acc_id)
+    
+    if not stations:
+        print(f"  ⚠️  No stations found for ACC {acc_id}")
+        return None
+    
+    # Filter for LiteON stations
+    liteon_pfids = []
+    for entry in stations.values():
+        if not entry.get("pfid"):
+            continue
+        evse_type = entry.get("evse_type", "Unknown")
+        if "liteon" in evse_type.lower():
+            liteon_pfids.append(entry.get("pfid"))
+    
+    if not liteon_pfids:
+        print(f"  ⚠️  No LiteON stations found for ACC {acc_id}")
+        return None
+    
+    # Sample a subset of stations to find pricing values (max 10 to be efficient)
+    sample_size = min(10, len(liteon_pfids))
+    sample_pfids = liteon_pfids[:sample_size]
+    
+    f_values = []
+    print(f"  📊 Sampling {sample_size} station(s) to determine pricing...")
+    
+    for pfid in sample_pfids:
+        response = get_configuration(pfid, "PricingSchedule")
+        schedule = extract_pricing_schedule(response)
+        
+        if schedule:
+            # Extract all f values from the schedule
+            for entry in schedule:
+                f_val = entry.get("f")
+                if f_val is not None:
+                    f_values.append(f_val)
+    
+    if not f_values:
+        print(f"  ⚠️  Could not extract pricing values from stations")
+        return None
+    
+    # Find the most common f value (majority)
+    counter = Counter(f_values)
+    most_common_value, count = counter.most_common(1)[0]
+    total = len(f_values)
+    percentage = (count / total) * 100
+    
+    print(f"  ✅ Majority pricing value: {most_common_value} ({percentage:.1f}% of {total} schedule entries)")
+    
+    return most_common_value
+
+
+def determine_pricing_mode(pfid_info: Dict[str, Optional[str]]) -> tuple:
+    """
+    Determine pricing mode based on hierarchy level and user input.
+    
+    Returns:
+        tuple: (mode, pricing_values_dict)
+        - mode: "auto" or "fixed"
+        - pricing_values_dict: {"acn-acc": value} for each ACC
+    """
+    mode = pfid_info["mode"]
+    acn = pfid_info["acn"]
+    acc = pfid_info["acc"]
+    
+    print(f"\n{'='*70}")
+    print("  💰 PRICING MODE SELECTION")
+    print(f"{'='*70}")
+    
+    # ACG or ACS level: always fixed mode
+    if mode in ("acn-acc-acg", "acn-acc-acg-acs"):
+        print(f"\n  ℹ️  Running at {mode.upper()} level")
+        print(f"  🔧 Using FIXED mode (required for this level)")
+        return prompt_fixed_mode(acn, acc)
+    
+    # ACN level (all ACCs): always auto mode, per-ACC basis
+    if mode == "acn-only":
+        print(f"\n  ℹ️  Running at ACN level")
+        print(f"  🔄 Using AUTO mode (per-ACC basis)")
+        print(f"  📋 Pricing values will be calculated for each ACC individually")
+        return "auto", {}
+    
+    # ACC level: prompt for auto/fixed
+    if mode == "acn-acc":
+        print(f"\n  ℹ️  Running at ACC level ({acn}-{acc})")
+        print(f"\n  Select pricing mode:")
+        print(f"    [1] 🔄 Auto  - Use majority value from already-configured stations")
+        print(f"    [2] 🔧 Fixed - Enter a specific value (0-1, e.g., 0.4 or 0.5)")
+        
+        while True:
+            choice = input("\n  Your choice (1/2): ").strip()
+            
+            if choice == "1":
+                # Auto mode - calculate or use cached value
+                cached = get_cached_pricing_value(acn, acc)
+                if cached is not None:
+                    print(f"\n  💾 Found cached pricing value for {acn}-{acc}: {cached}")
+                    use_cached = input("     Use cached value? (yes/no): ").strip().lower()
+                    if use_cached in ("yes", "y"):
+                        print(f"  ✅ Using cached value: {cached}")
+                        return "auto", {f"{acn}-{acc}": cached}
+                
+                # Calculate majority value
+                majority_value = calculate_majority_pricing(acn, acc)
+                if majority_value is not None:
+                    save_pricing_value(acn, acc, majority_value, source="auto")
+                    return "auto", {f"{acn}-{acc}": majority_value}
+                else:
+                    print(f"\n  ⚠️  Could not determine majority value. Falling back to fixed mode.")
+                    return prompt_fixed_mode(acn, acc)
+            
+            elif choice == "2":
+                return prompt_fixed_mode(acn, acc)
+            
+            else:
+                print("  ❌ Invalid choice. Enter 1 or 2.")
+    
+    # Default fallback
+    return prompt_fixed_mode(acn, acc)
+
+
+def prompt_fixed_mode(acn: str, acc: str) -> tuple:
+    """
+    Prompt user for a fixed pricing value.
+    
+    Returns:
+        tuple: ("fixed", {"acn-acc": value})
+    """
+    print(f"\n  🔧 Enter fixed pricing value (0-1, e.g., 0.4 or 0.5 cents/kWh):")
+    
+    while True:
+        try:
+            value_str = input("     Value: ").strip()
+            value = float(value_str)
+            
+            if 0 <= value <= 1:
+                # Save to cache for future reference
+                if acc:
+                    save_pricing_value(acn, acc, value, source="fixed")
+                print(f"\n  ✅ Using fixed pricing value: {value}")
+                key = f"{acn}-{acc}" if acc else acn
+                return "fixed", {key: value}
+            else:
+                print("     ⚠️  Value must be between 0 and 1.")
+        except ValueError:
+            print("     ❌ Invalid number. Enter a decimal value like 0.4 or 0.5.")
+
+
+def get_pricing_value_for_acc(acn_id: str, acc_id: str, pricing_mode: str, 
+                               pricing_values: Dict[str, float]) -> float:
+    """
+    Get the pricing value to use for a specific ACC.
+    
+    In auto mode for ACN-level runs, this calculates/retrieves the value per-ACC.
+    In fixed mode, it returns the fixed value.
+    """
+    key = f"{acn_id}-{acc_id}"
+    
+    # Check if we already have a value
+    if key in pricing_values:
+        return pricing_values[key]
+    
+    # In auto mode, calculate for this ACC
+    if pricing_mode == "auto":
+        # First check cache
+        cached = get_cached_pricing_value(acn_id, acc_id)
+        if cached is not None:
+            print(f"  💾 Using cached pricing value for {key}: {cached}")
+            pricing_values[key] = cached
+            return cached
+        
+        # Calculate majority value
+        majority_value = calculate_majority_pricing(acn_id, acc_id)
+        if majority_value is not None:
+            save_pricing_value(acn_id, acc_id, majority_value, source="auto")
+            pricing_values[key] = majority_value
+            return majority_value
+        else:
+            # Fallback to default 0.5
+            print(f"  ⚠️  Could not determine pricing for {key}, using default 0.5")
+            pricing_values[key] = 0.5
+            return 0.5
+    
+    # Fixed mode - should have been set already, default to 0.5
+    return pricing_values.get(key, 0.5)
 
 
 # ============================================================================
@@ -702,25 +951,29 @@ def format_schedule(schedule):
 # Main Processing Functions
 # ============================================================================
 def process_stations(acn_id: str, acc_id: str, acg_id: str = None, acs_id: str = None, 
-                     all_results: List[Dict] = None) -> List[Dict]:
+                     all_results: List[Dict] = None, expected_f: float = 0.5) -> List[Dict]:
     """
     Process stations based on PFID hierarchy level.
     - ACN-ACC: all stations under that ACC
     - ACN-ACC-ACG: stations matching the ACG prefix
     - ACN-ACC-ACG-ACS: single station
+    
+    Args:
+        expected_f: The expected pricing value to check against (default 0.5)
     """
     # Build display string
     display = format_pfid_display(acn_id, acc_id, acg_id, acs_id)
     
     print(f"\n{'─'*70}")
-    print(f"  Processing {display}")
+    print(f"  🔌 Processing {display}")
+    print(f"  💰 Expected pricing value (f): {expected_f}")
     print(f"{'─'*70}")
     
-    print("[INFO] Fetching station data...")
+    print("  📡 Fetching station data...")
     stations = fetch_station_data(acn_id, acc_id)
     
     if not stations:
-        print("[WARNING] No stations found for this ACC")
+        print("  ⚠️  No stations found for this ACC")
         return all_results or []
     
     # Build PFID prefix for filtering
@@ -751,24 +1004,25 @@ def process_stations(acn_id: str, acc_id: str, acg_id: str = None, acs_id: str =
     
     pfids = [entry.get("pfid") for entry in liteon_entries]
     
-    print(f"  LiteON stations to check: {len(pfids)}")
+    print(f"  🔋 LiteON stations to check: {len(pfids)}")
     if filtered_out > 0:
-        print(f"  Filtered out (different ACG/ACS): {filtered_out}")
+        print(f"  🚫 Filtered out (different ACG/ACS): {filtered_out}")
     if other_models:
-        print(f"  Skipping other models: {dict(sorted(other_models.items(), key=lambda x: -x[1]))}")
+        print(f"  ⏭️  Skipping other models: {dict(sorted(other_models.items(), key=lambda x: -x[1]))}")
     
     if not pfids:
         if pfid_prefix:
-            print(f"[WARNING] No LiteON stations found matching prefix: {pfid_prefix}")
+            print(f"  ⚠️  No LiteON stations found matching prefix: {pfid_prefix}")
         else:
-            print("[WARNING] No LiteON stations found")
+            print("  ⚠️  No LiteON stations found")
         return all_results or []
     
     if all_results is None:
         all_results = []
     
+    print("")
     for i, pfid in enumerate(pfids, 1):
-        print(f"[{i}/{len(pfids)}] Checking {pfid}...", end=" ", flush=True)
+        print(f"  [{i}/{len(pfids)}] 🔍 {pfid}...", end=" ", flush=True)
         
         # Get PricingScheduleEnable first
         enable_response = get_configuration(pfid, "PricingScheduleEnable")
@@ -784,8 +1038,8 @@ def process_stations(acn_id: str, acc_id: str, acg_id: str = None, acs_id: str =
         schedule_response = get_configuration(pfid, "PricingSchedule")
         schedule = extract_pricing_schedule(schedule_response)
         
-        # Check for mismatches
-        all_correct, mismatches = check_schedule_values(schedule)
+        # Check for mismatches against expected value
+        all_correct, mismatches = check_schedule_values(schedule, expected_f=expected_f)
         
         # Extract ACG and ACS from PFID for tracking
         pfid_parts = pfid.split("-")
@@ -801,25 +1055,26 @@ def process_stations(acn_id: str, acc_id: str, acg_id: str = None, acs_id: str =
             "schedule": schedule,
             "enabled": enabled,
             "all_correct": all_correct,
-            "mismatches": mismatches
+            "mismatches": mismatches,
+            "expected_f": expected_f
         })
         
-        status = "✓" if all_correct else "✗" if all_correct is False else "?"
+        status = "✅" if all_correct else "❌" if all_correct is False else "❓"
         print(status)
     
     return all_results
 
 
 # Alias for backward compatibility
-def process_acc(acn_id: str, acc_id: str, all_results: List[Dict] = None) -> List[Dict]:
+def process_acc(acn_id: str, acc_id: str, all_results: List[Dict] = None, expected_f: float = 0.5) -> List[Dict]:
     """Process a single ACN-ACC combination and return results."""
-    return process_stations(acn_id, acc_id, all_results=all_results)
+    return process_stations(acn_id, acc_id, all_results=all_results, expected_f=expected_f)
 
 
-def print_results(results: List[Dict]):
+def print_results(results: List[Dict], expected_f: float = 0.5):
     """Print the results summary."""
     print(f"\n{'='*70}")
-    print("  RESULTS")
+    print(f"  📋 RESULTS")
     print(f"{'='*70}\n")
     
     # Separate into correct and odd-ones-out
@@ -830,16 +1085,18 @@ def print_results(results: List[Dict]):
     # Print odd ones out first (the important ones)
     if odd_ones:
         print(f"{'─'*70}")
-        print("  ⚠️  ODD ONES OUT (f != 0.5)")
+        print(f"  ⚠️  ODD ONES OUT")
         print(f"{'─'*70}")
         for r in odd_ones:
             enabled_str = "✓ Enabled" if r["enabled"] else "✗ Disabled" if r["enabled"] is False else "? Unknown"
+            station_expected_f = r.get("expected_f", expected_f)
             print(f"\n  PFID: {r['pfid']} (ACN: {r.get('acn_id', 'N/A')}, ACC: {r.get('acc_id', 'N/A')})")
             print(f"  Enabled: {enabled_str}")
+            print(f"  Expected f: {station_expected_f}")
             print(f"  Schedule: {format_schedule(r['schedule'])}")
             print(f"  Issues:")
             for m in r["mismatches"]:
-                print(f"    - t={m['t']} has f={m['f']} (expected 0.5)")
+                print(f"    - t={m['t']} has f={m['f']} (expected {station_expected_f})")
     
     # Print unknown
     if unknown:
@@ -854,68 +1111,87 @@ def print_results(results: List[Dict]):
     # Print correct ones (summary)
     if correct:
         print(f"\n{'─'*70}")
-        print(f"  ✅ CORRECT ({len(correct)} stations with all f=0.5)")
+        print(f"  ✅ CORRECT ({len(correct)} stations)")
         print(f"{'─'*70}")
         for r in correct:
             enabled_str = "✓" if r["enabled"] else "✗" if r["enabled"] is False else "?"
-            print(f"  {r['pfid']} | ACN: {r.get('acn_id', 'N/A')} | ACC: {r.get('acc_id', 'N/A')} | Enabled: {enabled_str}")
+            station_f = r.get("expected_f", expected_f)
+            print(f"  {r['pfid']} | ACC: {r.get('acc_id', 'N/A')} | f={station_f} | Enabled: {enabled_str}")
     
     # Summary
     print(f"\n{'='*70}")
-    print("  SUMMARY")
+    print("  📊 SUMMARY")
     print(f"{'='*70}")
-    print(f"  Total stations:    {len(results)}")
-    print(f"  Correct (f=0.5):   {len(correct)}")
-    print(f"  Odd ones out:      {len(odd_ones)}")
-    print(f"  Unknown:           {len(unknown)}")
+    print(f"  📍 Total stations:    {len(results)}")
+    print(f"  ✅ Correct:           {len(correct)}")
+    print(f"  ⚠️  Odd ones out:      {len(odd_ones)}")
+    print(f"  ❓ Unknown:           {len(unknown)}")
     print(f"{'='*70}\n")
     
     return odd_ones, correct
 
 
-def get_correct_schedule(correct_stations):
-    """Get a correct schedule from a working station, or use default."""
-    default_schedule = [
-        {"t": 0, "f": 0.5},
-        {"t": 4, "f": 0.5},
-        {"t": 8, "f": 0.5},
-        {"t": 16, "f": 0.5},
-        {"t": 20, "f": 0.5}
-    ]
-    
+def get_correct_schedule(correct_stations, expected_f: float = 0.5):
+    """Get a correct schedule from a working station, or generate one with expected_f."""
+    # If we have a correct station, use its schedule
     if correct_stations and correct_stations[0].get("schedule"):
         return correct_stations[0]["schedule"]
+    
+    # Generate default schedule with the expected f value
+    default_schedule = [
+        {"t": 0, "f": expected_f},
+        {"t": 4, "f": expected_f},
+        {"t": 8, "f": expected_f},
+        {"t": 16, "f": expected_f},
+        {"t": 20, "f": expected_f}
+    ]
     
     return default_schedule
 
 
 def prompt_update_odd_ones(odd_ones, correct_stations, skip_prompt: bool = False, 
                           acn_id: str = None, acc_id: str = None, acg_id: str = None,
-                          acs_id: str = None, mode: str = None):
+                          acs_id: str = None, mode: str = None, expected_f: float = 0.5):
     """Prompt user to update odd ones out with correct schedule."""
-    correct_schedule = get_correct_schedule(correct_stations)
-    correct_schedule_str = json.dumps(correct_schedule)
-    
     # Determine site context from odd_ones if not provided
     if acn_id is None and odd_ones:
         acn_id = odd_ones[0].get("acn_id")
     
+    # Check if stations have different expected_f values (ACN-only mode)
+    unique_expected_f = set(r.get("expected_f", expected_f) for r in odd_ones)
+    has_multiple_expected_f = len(unique_expected_f) > 1
+    
+    # For single expected_f, generate one schedule; for multiple, we'll do per-station
+    if not has_multiple_expected_f:
+        correct_schedule = get_correct_schedule(correct_stations, expected_f=expected_f)
+        correct_schedule_str = json.dumps(correct_schedule)
+    
     # Save odd ones out to file for tracking (multi-site support)
-    save_odd_ones_out(odd_ones, correct_schedule, acn_id=acn_id, acc_id=acc_id, 
-                      acg_id=acg_id, acs_id=acs_id, mode=mode)
+    # Use the first station's expected_f for the saved schedule
+    first_expected_f = odd_ones[0].get("expected_f", expected_f) if odd_ones else expected_f
+    save_odd_ones_out(odd_ones, get_correct_schedule(correct_stations, expected_f=first_expected_f), 
+                      acn_id=acn_id, acc_id=acc_id, acg_id=acg_id, acs_id=acs_id, mode=mode)
     
     # Get site key for status updates
     site_key = get_site_key(acn_id, acc_id, acg_id, acs_id, mode) if acn_id else None
     
     print(f"\n{'='*70}")
-    print("  UPDATE ODD ONES OUT?")
+    print("  🛠️  UPDATE ODD ONES OUT?")
     print(f"{'='*70}")
-    print(f"\n  {len(odd_ones)} station(s) have incorrect PricingSchedule.")
-    print(f"\n  Correct schedule to apply:")
-    print(f"  {correct_schedule_str}")
-    print(f"\n  Stations to update:")
+    print(f"\n  ⚠️  {len(odd_ones)} station(s) have incorrect PricingSchedule.")
+    
+    if has_multiple_expected_f:
+        print(f"\n  ℹ️  Note: Stations have different expected pricing values.")
+        print(f"     Each station will be updated with its specific expected value.")
+    else:
+        correct_schedule = get_correct_schedule(correct_stations, expected_f=expected_f)
+        print(f"\n  📝 Correct schedule to apply (f={expected_f}):")
+        print(f"     {json.dumps(correct_schedule)}")
+    
+    print(f"\n  📋 Stations to update:")
     for r in odd_ones:
-        print(f"    - {r['pfid']} (ACN: {r.get('acn_id', 'N/A')}, ACC: {r.get('acc_id', 'N/A')})")
+        station_f = r.get("expected_f", expected_f)
+        print(f"     • {r['pfid']} (ACC: {r.get('acc_id', 'N/A')}, f={station_f})")
     
     if skip_prompt:
         do_update = True
@@ -924,22 +1200,28 @@ def prompt_update_odd_ones(odd_ones, correct_stations, skip_prompt: bool = False
         do_update = response in ("yes", "y")
     
     if do_update:
-        print(f"\n[INFO] Updating {len(odd_ones)} station(s)...\n")
+        print(f"\n  🚀 Updating {len(odd_ones)} station(s)...\n")
         
         accepted_count = 0
         rejected_count = 0
         
         for i, r in enumerate(odd_ones, 1):
             pfid = r["pfid"]
-            print(f"[{i}/{len(odd_ones)}] Updating {pfid}...", end=" ", flush=True)
+            station_expected_f = r.get("expected_f", expected_f)
             
-            result = set_configuration(pfid, "PricingSchedule", correct_schedule_str)
+            # Generate schedule for this station's expected_f
+            station_schedule = get_correct_schedule([], expected_f=station_expected_f)
+            station_schedule_str = json.dumps(station_schedule)
+            
+            print(f"  [{i}/{len(odd_ones)}] {pfid} (f={station_expected_f})...", end=" ", flush=True)
+            
+            result = set_configuration(pfid, "PricingSchedule", station_schedule_str)
             
             nats_response = result.get("natsResponse", {})
             if isinstance(nats_response, dict):
                 status = nats_response.get("status", "Unknown")
                 if status == "Accepted":
-                    print("✓ Accepted")
+                    print("✅ Accepted")
                     update_odd_ones_status(pfid, "accepted", site_key=site_key)
                     accepted_count += 1
                 else:
@@ -957,34 +1239,34 @@ def prompt_update_odd_ones(odd_ones, correct_stations, skip_prompt: bool = False
                         # Include full response if no specific reason found
                         rejection_reason = json.dumps(nats_response)
                     
-                    print(f"⚠ {status}")
+                    print(f"⚠️  {status}")
                     if rejection_reason:
-                        print(f"      Reason: {rejection_reason}")
+                        print(f"          Reason: {rejection_reason}")
                     
                     update_odd_ones_status(pfid, "rejected", rejection_reason, site_key=site_key)
                     rejected_count += 1
             else:
                 error_msg = str(nats_response) if nats_response else "Unknown error"
-                print(f"? {error_msg}")
+                print(f"❌ {error_msg}")
                 update_odd_ones_status(pfid, "error", error_msg, site_key=site_key)
                 rejected_count += 1
             
             # Check for error in the result itself
             if "error" in result:
                 error_msg = result.get("error")
-                print(f"      Error: {error_msg}")
+                print(f"          ❌ Error: {error_msg}")
                 update_odd_ones_status(pfid, "error", error_msg, site_key=site_key)
         
-        print(f"\n[INFO] Update complete.")
-        print(f"  Accepted: {accepted_count}")
-        print(f"  Rejected/Error: {rejected_count}")
+        print(f"\n  ✅ Update complete!")
+        print(f"     ✅ Accepted: {accepted_count}")
+        print(f"     ⚠️  Rejected/Error: {rejected_count}")
         
         if rejected_count > 0:
-            print(f"\n[INFO] Rejected stations saved to: {ODD_ONES_FILE}")
-            print(f"[INFO] Use --retry flag to retry updating rejected stations.")
+            print(f"\n  💾 Rejected stations saved to: {ODD_ONES_FILE}")
+            print(f"  💡 Use --retry flag to retry updating rejected stations.")
     else:
-        print("\n[INFO] No changes made.")
-        print(f"[INFO] Odd ones out saved to: {ODD_ONES_FILE}")
+        print("\n  ℹ️  No changes made.")
+        print(f"  💾 Odd ones out saved to: {ODD_ONES_FILE}")
 
 
 def main_pfid(pfid_info: Dict[str, Optional[str]], resume_progress: Dict = None):
@@ -1008,27 +1290,30 @@ def main_pfid(pfid_info: Dict[str, Optional[str]], resume_progress: Dict = None)
     
     print(f"\n{'='*70}")
     if mode == "acn-only":
-        print(f"  Pricing Schedule Check for ALL ACCs under ACN: {acn}")
+        print(f"  ⚡ Pricing Schedule Check for ALL ACCs under ACN: {acn}")
     elif mode == "acn-acc-acg-acs":
-        print(f"  Pricing Schedule Check for Single Station: {site_key}")
+        print(f"  ⚡ Pricing Schedule Check for Single Station: {site_key}")
     elif mode == "acn-acc-acg":
-        print(f"  Pricing Schedule Check for ACG: {site_key}")
+        print(f"  ⚡ Pricing Schedule Check for ACG: {site_key}")
     else:
-        print(f"  Pricing Schedule Check for {display}")
+        print(f"  ⚡ Pricing Schedule Check for {display}")
     print(f"{'='*70}\n")
+    
+    # Determine pricing mode and values
+    pricing_mode, pricing_values = determine_pricing_mode(pfid_info)
     
     # ACN-only mode: iterate through all ACCs
     if mode == "acn-only":
-        print("[INFO] Loading site data to find all ACCs...")
+        print("\n📂 Loading site data to find all ACCs...")
         site_data = get_site_data()
         
         accs = get_accs_for_acn(site_data, acn)
         
         if not accs:
-            print(f"[ERROR] No ACCs found for ACN: {acn}")
+            print(f"❌ No ACCs found for ACN: {acn}")
             sys.exit(1)
         
-        print(f"[INFO] Found {len(accs)} ACC(s) for ACN {acn}: {', '.join(accs)}")
+        print(f"✅ Found {len(accs)} ACC(s) for ACN {acn}: {', '.join(accs)}")
         
         # Check for resume
         completed_accs = []
@@ -1046,6 +1331,8 @@ def main_pfid(pfid_info: Dict[str, Optional[str]], resume_progress: Dict = None)
             "total_accs": len(accs),
             "completed_accs": completed_accs,
             "results": all_results,
+            "pricing_mode": pricing_mode,
+            "pricing_values": pricing_values,
             "started_at": resume_progress.get('started_at') if resume_progress else datetime.now().isoformat()
         }
         
@@ -1055,18 +1342,30 @@ def main_pfid(pfid_info: Dict[str, Optional[str]], resume_progress: Dict = None)
                 print(f"\n[{i}/{len(accs)}] Skipping ACC {acc_id} (already completed)")
                 continue
             
+            # Get pricing value for this ACC (auto mode calculates per-ACC)
+            expected_f = get_pricing_value_for_acc(acn, acc_id, pricing_mode, pricing_values)
+            
             print(f"\n[{i}/{len(accs)}] Processing ACC: {acc_id}")
-            all_results = process_stations(acn, acc_id, all_results=all_results)
+            all_results = process_stations(acn, acc_id, all_results=all_results, expected_f=expected_f)
             
             # Update progress
             completed_accs.append(acc_id)
             progress['completed_accs'] = completed_accs
             progress['results'] = all_results
+            progress['pricing_values'] = pricing_values  # Save updated values
             save_progress(progress)
         
         results = all_results
+        # For ACN-only mode with auto, we can't show a single expected_f in results
+        # Use 0.5 as display placeholder (individual ACC values were used during processing)
+        display_expected_f = 0.5
     else:
         # All other modes: process specific stations
+        # Get the expected_f value for this ACC
+        key = f"{acn}-{acc}"
+        expected_f = pricing_values.get(key, 0.5)
+        display_expected_f = expected_f
+        
         # Save progress for potential resume
         progress = {
             "mode": mode,
@@ -1074,18 +1373,21 @@ def main_pfid(pfid_info: Dict[str, Optional[str]], resume_progress: Dict = None)
             "acc_id": acc,
             "acg_id": acg,
             "acs_id": acs,
+            "pricing_mode": pricing_mode,
+            "pricing_values": pricing_values,
+            "expected_f": expected_f,
             "started_at": datetime.now().isoformat()
         }
         save_progress(progress)
         
-        results = process_stations(acn, acc, acg, acs)
+        results = process_stations(acn, acc, acg, acs, expected_f=expected_f)
     
     # Print results
-    odd_ones, correct = print_results(results)
+    odd_ones, correct = print_results(results, expected_f=display_expected_f)
     
     if odd_ones:
         prompt_update_odd_ones(odd_ones, correct, acn_id=acn, acc_id=acc, 
-                               acg_id=acg, acs_id=acs, mode=mode)
+                               acg_id=acg, acs_id=acs, mode=mode, expected_f=display_expected_f)
     
     # Delete progress on completion
     delete_progress()
